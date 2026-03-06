@@ -1,0 +1,17 @@
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local env and runtime secrets
+.env
+.runtime_tokens.json
+
+# VS Code
+.vscode/*.log
