@@ -10,12 +10,18 @@ from typing import Annotated, Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from collections import deque
+from datetime import datetime
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, HTTPException, Query, Request as FastAPIRequest
+from fastapi import FastAPI, Form, Header, HTTPException, Query, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from pydantic import BaseModel
 
 from src.main import bootstrap_orchestrator
+from src.integrations.telegram import TelegramProvider
 from src.integrations.token_store import get_token, upsert_tokens
+from src.integrations.webchat import WebChatProvider
 from src.integrations.whatsapp import WhatsAppProvider
 
 load_dotenv()
@@ -23,6 +29,26 @@ load_dotenv()
 app = FastAPI(title="Lightweight AI Agent API", version="0.1.0")
 orchestrator = bootstrap_orchestrator()
 whatsapp_provider = WhatsAppProvider()
+telegram_provider = TelegramProvider()
+webchat_provider = WebChatProvider()
+
+_MESSAGE_LOG: deque[dict[str, Any]] = deque(maxlen=100)
+
+
+def _add_message(channel: str, sender: str, role: str, text: str) -> None:
+    _MESSAGE_LOG.append({
+        "id": len(_MESSAGE_LOG),
+        "channel": channel,
+        "sender": sender,
+        "role": role,
+        "text": text,
+        "timestamp": datetime.now().isoformat(),
+    })
+
+
+class WebChatMessageIn(BaseModel):
+    session_id: str
+    message: str
 
 
 @dataclass
@@ -72,65 +98,84 @@ def root() -> dict[str, Any]:
         "status": "running",
         "endpoints": {
             "health": "/health",
+            "admin": "/admin",
+            "admin_skills": "/admin/skills",
+            "webchat_ui": "/chat",
+            "webchat_message": "/webchat/message",
             "google_auth_start": "/auth/google/start?services=gmail,calendar&redirect=true",
             "google_auth_callback": "/auth/google/callback",
-            "whatsapp_meta_verify": "/webhooks/whatsapp/meta",
-            "whatsapp_twilio_webhook": "/webhooks/whatsapp/twilio",
+            "telegram_webhook": "/webhooks/telegram",
         },
     }
 
 
 def _connected(service: str) -> bool:
-        if service == "gmail":
-                return bool(
-                        os.getenv("GMAIL_ACCESS_TOKEN")
-                        or os.getenv("GMAIL_REFRESH_TOKEN")
-                        or get_token("GMAIL_ACCESS_TOKEN")
-                        or get_token("GMAIL_REFRESH_TOKEN")
-                )
-        if service == "calendar":
-                return bool(
-                        os.getenv("GOOGLE_CALENDAR_ACCESS_TOKEN")
-                        or os.getenv("GOOGLE_CALENDAR_REFRESH_TOKEN")
-                        or get_token("GOOGLE_CALENDAR_ACCESS_TOKEN")
-                        or get_token("GOOGLE_CALENDAR_REFRESH_TOKEN")
-                )
-        if service == "whatsapp_meta":
-                return bool(
-                        os.getenv("WHATSAPP_PHONE_NUMBER_ID")
-                        or get_token("WHATSAPP_PHONE_NUMBER_ID")
-                ) and bool(
-                        os.getenv("WHATSAPP_ACCESS_TOKEN")
-                        or get_token("WHATSAPP_ACCESS_TOKEN")
-                )
-        if service == "whatsapp_twilio":
-                return bool(
-                        os.getenv("TWILIO_ACCOUNT_SID")
-                        or get_token("TWILIO_ACCOUNT_SID")
-                ) and bool(
-                        os.getenv("TWILIO_AUTH_TOKEN")
-                        or get_token("TWILIO_AUTH_TOKEN")
-                ) and bool(
-                        os.getenv("TWILIO_WHATSAPP_NUMBER")
-                        or get_token("TWILIO_WHATSAPP_NUMBER")
-                )
-        return False
+    if service == "gmail":
+        return bool(
+            os.getenv("GMAIL_ACCESS_TOKEN")
+            or os.getenv("GMAIL_REFRESH_TOKEN")
+            or get_token("GMAIL_ACCESS_TOKEN")
+            or get_token("GMAIL_REFRESH_TOKEN")
+        )
+    if service == "calendar":
+        return bool(
+            os.getenv("GOOGLE_CALENDAR_ACCESS_TOKEN")
+            or os.getenv("GOOGLE_CALENDAR_REFRESH_TOKEN")
+            or get_token("GOOGLE_CALENDAR_ACCESS_TOKEN")
+            or get_token("GOOGLE_CALENDAR_REFRESH_TOKEN")
+        )
+    if service == "telegram":
+        return bool(
+            os.getenv("TELEGRAM_BOT_TOKEN")
+            or get_token("TELEGRAM_BOT_TOKEN")
+        )
+    return False
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(message: str | None = Query(default=None)) -> HTMLResponse:
-        google_connected = _connected("gmail") and _connected("calendar")
-        meta_connected = _connected("whatsapp_meta")
-        twilio_connected = _connected("whatsapp_twilio")
+    google_connected = _connected("gmail") and _connected("calendar")
+    telegram_connected = _connected("telegram")
 
-        status_google = "Connected" if google_connected else "Not connected"
-        status_meta = "Configured" if meta_connected else "Not configured"
-        status_twilio = "Configured" if twilio_connected else "Not configured"
-        message_html = (
-                f"<div class='notice success'>{escape(message)}</div>" if message else ""
-        )
+    not_configured = "Not configured"
+    status_google = "Connected" if google_connected else "Not connected"
+    status_telegram = "Configured" if telegram_connected else not_configured
+    google_action_html = (
+        """
+        <div class='action-row'>
+            <button class='button connected' type='button' disabled>Google Connected</button>
+            <a class='button secondary' href='/auth/google/start?services=gmail,calendar&redirect=true'>Reconnect Google</a>
+        </div>
+        """
+        if google_connected
+        else "<a class='button' href='/auth/google/start?services=gmail,calendar&redirect=true'>Connect Google</a>"
+    )
+    telegram_action_html = (
+        """
+                <div class='action-row'>
+                    <button class='button connected' type='button' disabled>Telegram Connected</button>
+                    <span class='muted'>Use the form below to reconnect or rotate token.</span>
+                </div>
+                <form method='post' action='/auth/telegram/config'>
+                    <div class='row'><label>Bot Token</label><input name='bot_token' /></div>
+                    <div class='row'><label>Webhook Secret (optional)</label><input name='webhook_secret' /></div>
+                    <button type='submit'>Reconnect Telegram</button>
+                </form>
+        """
+        if telegram_connected
+        else """
+                <form method='post' action='/auth/telegram/config'>
+                    <div class='row'><label>Bot Token</label><input name='bot_token' /></div>
+                    <div class='row'><label>Webhook Secret (optional)</label><input name='webhook_secret' /></div>
+                    <button type='submit'>Save Telegram Credentials</button>
+                </form>
+        """
+    )
+    message_html = (
+        f"<div class='notice success'>{escape(message)}</div>" if message else ""
+    )
 
-        html = f"""
+    html = f"""
 <!DOCTYPE html>
 <html lang='en'>
 <head>
@@ -171,55 +216,245 @@ def admin_page(message: str | None = Query(default=None)) -> HTMLResponse:
             font-size: 14px;
             cursor: pointer;
         }}
+        .button.connected {{
+            background: var(--ok);
+            cursor: not-allowed;
+            opacity: 0.95;
+        }}
+        .button.secondary {{
+            background: #374151;
+        }}
+        .action-row {{
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+        }}
         .muted {{ color: var(--muted); font-size: 12px; margin-top: 6px; }}
         .notice {{ margin: 0 0 18px; padding: 10px 12px; border-radius: 10px; font-size: 14px; }}
         .notice.success {{ background: #ecfdf3; color: #166534; border: 1px solid #86efac; }}
+        .required {{
+            display: inline-block;
+            margin-left: 8px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #1d4ed8;
+            background: #dbeafe;
+            border: 1px solid #93c5fd;
+        }}
+        .chat-wrap {{
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: #f9fafb;
+            padding: 10px;
+        }}
+        .chat-log {{
+            height: 230px;
+            overflow-y: auto;
+            background: #fff;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 8px;
+            margin-bottom: 10px;
+            font-size: 13px;
+        }}
+        .chat-item {{ margin-bottom: 8px; }}
+        .chat-user {{ color: #111827; }}
+        .chat-agent {{ color: #1d4ed8; }}
+        .skill-list {{ display: grid; gap: 10px; }}
+        .skill-item {{
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            align-items: center;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px;
+            background: #fafafa;
+        }}
+        .skill-name {{ font-weight: 600; }}
+        .skill-meta {{ font-size: 12px; color: var(--muted); }}
+        .skill-toggle {{ background: #111827; }}
+        .skill-toggle.enable {{ background: #166534; }}
+        .skill-toggle.disable {{ background: #b91c1c; }}
     </style>
 </head>
 <body>
     <div class='container'>
         <h1 class='title'>Admin Authentication</h1>
-        <p class='subtitle'>Connect Google and WhatsApp with simple buttons.</p>
+        <p class='subtitle'>Google and Webchat are required. WhatsApp and Telegram are optional channels.</p>
         {message_html}
         <div class='grid'>
             <div class='card'>
-                <h3>Google (Gmail + Calendar)</h3>
+                <h3>Google (Gmail + Calendar)<span class='required'>Mandatory</span></h3>
                 <div class='status'>Status: <span class='{"ok" if google_connected else ""}'>{status_google}</span></div>
-                <a class='button' href='/auth/google/start?services=gmail,calendar&redirect=true'>Connect Google</a>
+                {google_action_html}
                 <div class='muted'>Uses OAuth consent and stores tokens automatically.</div>
             </div>
 
             <div class='card'>
-                <h3>WhatsApp (Meta Cloud API)</h3>
-                <div class='status'>Status: <span class='{"ok" if meta_connected else ""}'>{status_meta}</span></div>
-                <form method='post' action='/auth/whatsapp/config'>
-                    <input type='hidden' name='provider' value='meta' />
-                    <div class='row'><label>Phone Number ID</label><input name='phone_number_id' /></div>
-                    <div class='row'><label>Access Token</label><input name='access_token' /></div>
-                    <div class='row'><label>Verify Token</label><input name='verify_token' /></div>
-                    <button type='submit'>Save Meta Credentials</button>
-                </form>
-                <div class='muted'>Webhook verify URL: /webhooks/whatsapp/meta</div>
+                <h3>Webchat<span class='required'>Mandatory</span></h3>
+                <div class='status'>Status: <span class='ok'>Ready</span></div>
+                <div class='chat-wrap'>
+                    <div id='admin-chat-log' class='chat-log'></div>
+                    <div class='row'>
+                        <label>Type and press Enter</label>
+                        <input id='admin-chat-input' placeholder='add task prepare sprint demo' autocomplete='off' />
+                    </div>
+                </div>
+                <div class='muted'>No external auth required. Messages are sent directly from this page.</div>
+            </div>
+
+
+            <div class='card'>
+                <h3>Telegram Bot</h3>
+                <div class='status'>Status: <span class='{"ok" if telegram_connected else ""}'>{status_telegram}</span></div>
+                {telegram_action_html}
+                <div class='muted'>Webhook URL: /webhooks/telegram</div>
             </div>
 
             <div class='card'>
-                <h3>WhatsApp (Twilio)</h3>
-                <div class='status'>Status: <span class='{"ok" if twilio_connected else ""}'>{status_twilio}</span></div>
-                <form method='post' action='/auth/whatsapp/config'>
-                    <input type='hidden' name='provider' value='twilio' />
-                    <div class='row'><label>Account SID</label><input name='twilio_sid' /></div>
-                    <div class='row'><label>Auth Token</label><input name='twilio_auth_token' /></div>
-                    <div class='row'><label>WhatsApp Number (e.g. whatsapp:+14155238886)</label><input name='twilio_whatsapp_number' /></div>
-                    <button type='submit'>Save Twilio Credentials</button>
-                </form>
-                <div class='muted'>Webhook URL: /webhooks/whatsapp/twilio</div>
+                <h3>Skills</h3>
+                <div class='status'>Enable or disable registered skills without restarting.</div>
+                <div id='skills-list' class='skill-list'></div>
             </div>
         </div>
     </div>
+    <script>
+        const sessionId = 'admin-webchat-user';
+        const log = document.getElementById('admin-chat-log');
+        const input = document.getElementById('admin-chat-input');
+
+        function addLine(text, cls) {{
+            const item = document.createElement('div');
+            item.className = 'chat-item ' + cls;
+            item.textContent = text;
+            log.appendChild(item);
+            log.scrollTop = log.scrollHeight;
+        }}
+
+        async function sendMessage(message) {{
+            addLine('You: ' + message, 'chat-user');
+            try {{
+                const response = await fetch('/webchat/message', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ session_id: sessionId, message }})
+                }});
+                const data = await response.json();
+                addLine('Agent: ' + (data.reply || data.message || 'OK'), 'chat-agent');
+            }} catch (error) {{
+                addLine('Agent: Failed to send message.', 'chat-agent');
+            }}
+        }}
+
+        input.addEventListener('keydown', function(event) {{
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            const message = input.value.trim();
+            if (!message) return;
+            input.value = '';
+            sendMessage(message);
+        }});
+
+        let lastMsgId = -1;
+        async function pollMessages() {{
+            try {{
+                // Poll Telegram for new messages first
+                await fetch('/telegram/poll', {{ method: 'POST' }});
+                
+                // Then fetch all new messages from the log
+                const response = await fetch('/messages?since=' + (lastMsgId + 1));
+                const messages = await response.json();
+                messages.forEach(msg => {{
+                    if (msg.id > lastMsgId) {{
+                        const label = msg.role === 'user' ? '[' + msg.channel + '] ' + msg.sender + ': ' : 'Agent: ';
+                        const cls = msg.role === 'user' ? 'chat-user' : 'chat-agent';
+                        addLine(label + msg.text, cls);
+                        lastMsgId = msg.id;
+                    }}
+                }});
+            }} catch (e) {{}}
+        }}
+
+        function renderSkills(skills) {{
+            const box = document.getElementById('skills-list');
+            box.innerHTML = '';
+            if (!skills.length) {{
+                box.innerHTML = '<div class="skill-meta">No skills registered.</div>';
+                return;
+            }}
+            for (const skill of skills) {{
+                const item = document.createElement('div');
+                item.className = 'skill-item';
+
+                const info = document.createElement('div');
+                const envHint = skill.required_env.length ? ('Requires: ' + skill.required_env.join(', ')) : 'No required env vars';
+                info.innerHTML = '<div class="skill-name">' + skill.name + (skill.enabled ? ' (enabled)' : ' (disabled)') + '</div>' +
+                                 '<div class="skill-meta">v' + skill.version + ' • ' + (skill.description || 'No description') + '</div>' +
+                                 '<div class="skill-meta">Actions: ' + (skill.actions.join(', ') || 'n/a') + '</div>' +
+                                 '<div class="skill-meta">' + envHint + '</div>';
+
+                const action = document.createElement('button');
+                action.className = 'button skill-toggle ' + (skill.enabled ? 'disable' : 'enable');
+                action.textContent = skill.enabled ? 'Disable' : 'Enable';
+                action.onclick = () => setSkillEnabled(skill.name, !skill.enabled);
+
+                item.appendChild(info);
+                item.appendChild(action);
+                box.appendChild(item);
+            }}
+        }}
+
+        async function loadSkills() {{
+            try {{
+                const response = await fetch('/admin/skills');
+                const data = await response.json();
+                renderSkills(data.skills || []);
+            }} catch (e) {{
+                const box = document.getElementById('skills-list');
+                box.innerHTML = '<div class="skill-meta">Failed to load skills.</div>';
+            }}
+        }}
+
+        async function setSkillEnabled(skillName, enabled) {{
+            const route = enabled ? 'enable' : 'disable';
+            await fetch('/admin/skills/' + encodeURIComponent(skillName) + '/' + route, {{ method: 'POST' }});
+            loadSkills();
+        }}
+
+        loadSkills();
+        pollMessages();
+        setInterval(pollMessages, 2000);
+    </script>
 </body>
 </html>
 """
-        return HTMLResponse(html)
+    return HTMLResponse(html)
+
+
+@app.get("/admin/skills")
+def admin_skills() -> dict[str, Any]:
+    return {"skills": orchestrator.skill_registry.list_registered_skills()}
+
+
+@app.post("/admin/skills/{skill_name}/enable")
+def admin_enable_skill(skill_name: str) -> dict[str, Any]:
+    changed = orchestrator.skill_registry.enable_skill(skill_name)
+    if not changed:
+        raise HTTPException(status_code=404, detail=f"Unknown skill: {skill_name}")
+    return {"ok": True, "skill": skill_name, "enabled": True}
+
+
+@app.post("/admin/skills/{skill_name}/disable")
+def admin_disable_skill(skill_name: str) -> dict[str, Any]:
+    changed = orchestrator.skill_registry.disable_skill(skill_name)
+    if not changed:
+        raise HTTPException(status_code=404, detail=f"Unknown skill: {skill_name}")
+    return {"ok": True, "skill": skill_name, "enabled": False}
 
 
 @app.post("/auth/whatsapp/config")
@@ -257,6 +492,20 @@ def whatsapp_configure(
                 return RedirectResponse(url="/admin?message=Twilio+WhatsApp+configured", status_code=303)
 
         return RedirectResponse(url="/admin?message=Unsupported+provider", status_code=303)
+
+
+@app.post("/auth/telegram/config")
+def telegram_configure(
+    bot_token: Annotated[str, Form()],
+    webhook_secret: Annotated[str, Form()] = "",
+) -> RedirectResponse:
+    updates = {
+        "TELEGRAM_BOT_TOKEN": bot_token,
+        "TELEGRAM_WEBHOOK_SECRET": webhook_secret,
+    }
+    upsert_tokens(updates)
+    os.environ.update({key: str(value) for key, value in updates.items() if value})
+    return RedirectResponse(url="/admin?message=Telegram+configured", status_code=303)
 
 
 @app.get("/auth/google/start", response_model=None, responses={400: {"description": "Missing OAuth client id"}})
@@ -376,40 +625,172 @@ def google_auth_callback(
     }
 
 
-@app.get("/webhooks/whatsapp/meta", responses={403: {"description": "Invalid verify token"}})
-def whatsapp_meta_verify(
-    mode: Annotated[str | None, Query(alias="hub.mode")] = None,
-    challenge: Annotated[str | None, Query(alias="hub.challenge")] = None,
-    verify_token: Annotated[str | None, Query(alias="hub.verify_token")] = None,
-) -> PlainTextResponse:
-    expected_token = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
-    if mode == "subscribe" and verify_token and verify_token == expected_token:
-        return PlainTextResponse(challenge or "")
-    raise HTTPException(status_code=403, detail="Invalid verify token")
 
 
-@app.post("/webhooks/whatsapp/meta")
-async def whatsapp_meta_webhook(request: FastAPIRequest) -> dict[str, str]:
-    payload = await request.json()
-    entries = payload.get("entry", []) if isinstance(payload, dict) else []
-    for entry in entries:
-        for change in entry.get("changes", []):
-            messages = change.get("value", {}).get("messages", [])
-            for message in messages:
-                sender = message.get("from")
-                text = message.get("text", {}).get("body", "")
-                if sender and text:
-                    orchestrator.handle_whatsapp_command(text=text, sender=sender, provider=whatsapp_provider)
-
-    return {"status": "ok"}
 
 
-@app.post("/webhooks/whatsapp/twilio", responses={400: {"description": "Missing sender number"}})
-def whatsapp_twilio_webhook(
-    body: Annotated[str, Form()] = "",
-    from_number: Annotated[str, Form(alias="From")] = "",
-) -> JSONResponse:
-    if not from_number:
-        raise HTTPException(status_code=400, detail="Missing From")
-    result = orchestrator.handle_whatsapp_command(text=body, sender=from_number, provider=whatsapp_provider)
-    return JSONResponse({"status": "ok", "message": result.message})
+
+@app.get("/chat", response_class=HTMLResponse)
+def webchat_page() -> HTMLResponse:
+        html = """
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='UTF-8' />
+    <meta name='viewport' content='width=device-width, initial-scale=1.0' />
+    <title>Webchat</title>
+    <style>
+        body { font-family: Segoe UI, Inter, Arial, sans-serif; background: #f6f8fb; margin: 0; }
+        .wrap { max-width: 760px; margin: 30px auto; padding: 0 16px; }
+        .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; }
+        .log { height: 340px; overflow-y: auto; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px; margin-bottom: 12px; }
+        .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+        input { padding: 10px; border: 1px solid #d1d5db; border-radius: 10px; }
+        button { background: #2563eb; color: #fff; border: none; border-radius: 10px; padding: 10px 14px; }
+        .item { margin-bottom: 8px; }
+        .user { color: #111827; }
+        .bot { color: #1d4ed8; }
+    </style>
+</head>
+<body>
+    <div class='wrap'>
+        <div class='card'>
+            <h2>Webchat</h2>
+            <div id='log' class='log'></div>
+            <div class='row'>
+                <input id='msg' placeholder='Type: add task prepare sprint demo' />
+                <button onclick='send()'>Send</button>
+            </div>
+        </div>
+    </div>
+    <script>
+        const sessionId = 'webchat-demo-user';
+        const log = document.getElementById('log');
+        const input = document.getElementById('msg');
+        function addLine(text, cls){
+            const d = document.createElement('div');
+            d.className = 'item ' + cls;
+            d.textContent = text;
+            log.appendChild(d);
+            log.scrollTop = log.scrollHeight;
+        }
+        async function send(){
+            const message = input.value.trim();
+            if(!message) return;
+            addLine('You: ' + message, 'user');
+            input.value = '';
+            const response = await fetch('/webchat/message', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({session_id: sessionId, message})
+            });
+            const data = await response.json();
+            addLine('Agent: ' + (data.reply || data.message || 'OK'), 'bot');
+        }
+    </script>
+</body>
+</html>
+"""
+        return HTMLResponse(html)
+
+
+@app.post("/webchat/message")
+def webchat_message(payload: WebChatMessageIn) -> dict[str, Any]:
+        result = orchestrator.handle_channel_command(
+                text=payload.message,
+                sender=payload.session_id,
+                provider=webchat_provider,
+        )
+        return {
+                "success": result.success,
+                "reply": result.message,
+                "action": result.action,
+                "data": result.data,
+        }
+
+
+# Track last processed Telegram update ID for polling
+_LAST_TELEGRAM_UPDATE_ID: int = 0
+
+
+@app.get("/messages")
+def get_messages(since: int = Query(default=0)) -> list[dict[str, Any]]:
+    return [msg for msg in _MESSAGE_LOG if msg["id"] >= since]
+
+
+@app.post("/telegram/poll")
+def telegram_poll() -> dict[str, Any]:
+    """
+    Poll Telegram for new messages and process them.
+    This is an alternative to webhooks for development/testing.
+    """
+    global _LAST_TELEGRAM_UPDATE_ID
+    
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or get_token("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        return {"status": "error", "message": "No Telegram bot token configured"}
+    
+    import json as json_module
+    from urllib.request import Request as UrlRequest
+    
+    # Fetch updates since last processed update
+    offset = _LAST_TELEGRAM_UPDATE_ID + 1 if _LAST_TELEGRAM_UPDATE_ID else None
+    url = f"https://api.telegram.org/bot{bot_token}/getUpdates?limit=10&timeout=1"
+    if offset:
+        url += f"&offset={offset}"
+    
+    try:
+        req = UrlRequest(url, method="GET")
+        with urlopen(req, timeout=5) as response:
+            data = json_module.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    
+    updates = data.get("result", []) if data.get("ok") else []
+    processed = 0
+    
+    for update in updates:
+        update_id = update.get("update_id", 0)
+        _LAST_TELEGRAM_UPDATE_ID = max(_LAST_TELEGRAM_UPDATE_ID, update_id)
+        
+        message = update.get("message") or update.get("edited_message") or {}
+        text = message.get("text", "")
+        sender = str((message.get("chat") or {}).get("id", ""))
+        
+        if sender and text:
+            # Check if this message is already in the log (avoid duplicates)
+            already_logged = any(
+                msg.get("channel") == "telegram" 
+                and msg.get("sender") == sender 
+                and msg.get("text") == text
+                for msg in list(_MESSAGE_LOG)[-20:]
+            )
+            
+            if not already_logged:
+                _add_message(channel="telegram", sender=sender, role="user", text=text)
+                result = orchestrator.handle_channel_command(text=text, sender=sender, provider=telegram_provider)
+                _add_message(channel="telegram", sender="agent", role="agent", text=result.message)
+                processed += 1
+    
+    return {"status": "ok", "processed": processed, "last_update_id": _LAST_TELEGRAM_UPDATE_ID}
+
+
+@app.post("/webhooks/telegram")
+async def telegram_webhook(
+        request: FastAPIRequest,
+        x_telegram_bot_api_secret_token: Annotated[str | None, Header()] = None,
+) -> dict[str, str]:
+        expected_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET") or get_token("TELEGRAM_WEBHOOK_SECRET")
+        if expected_secret and x_telegram_bot_api_secret_token != expected_secret:
+                raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
+
+        payload = await request.json()
+        message = payload.get("message") or payload.get("edited_message") or {}
+        text = message.get("text", "")
+        sender = str((message.get("chat") or {}).get("id", ""))
+        if sender and text:
+                _add_message(channel="telegram", sender=sender, role="user", text=text)
+                result = orchestrator.handle_channel_command(text=text, sender=sender, provider=telegram_provider)
+                _add_message(channel="telegram", sender="agent", role="agent", text=result.message)
+
+        return {"status": "ok"}

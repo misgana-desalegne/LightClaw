@@ -8,6 +8,7 @@ from urllib.parse import urlencode
 
 from dotenv import load_dotenv
 
+from src.agent.loader import load_skills
 from src.agent.context import Context
 from src.agent.orchestrator import Orchestrator
 from src.agent.registry import SkillRegistry
@@ -16,11 +17,7 @@ from src.integrations.google_calendar import CalendarProvider
 from src.integrations.llm import build_llm_provider_from_env
 from src.integrations.token_store import get_token
 from src.integrations.whatsapp import WhatsAppProvider
-from src.integrations.web_search import WebSearchProvider
 from src.models.schemas import IntentRequest
-from src.skills.calendar.skill import CalendarSkill
-from src.skills.email.skill import EmailSkill
-from src.skills.events.skill import EventsSkill
 from src.utils.logger import get_logger
 
 
@@ -53,11 +50,14 @@ def bootstrap_orchestrator() -> Orchestrator:
 
     calendar_provider = CalendarProvider()
     gmail_provider = GmailProvider()
-    web_provider = WebSearchProvider()
-
-    registry.register_skill(CalendarSkill(calendar_provider))
-    registry.register_skill(EmailSkill(gmail_provider, llm_provider))
-    registry.register_skill(EventsSkill(web_provider, llm_provider))
+    load_skills(
+        registry=registry,
+        dependencies={
+            "llm_provider": llm_provider,
+            "calendar_provider": calendar_provider,
+            "gmail_provider": gmail_provider,
+        },
+    )
 
     return Orchestrator(skill_registry=registry, context=context, llm=llm_provider, retries=2, logger=logger)
 
@@ -82,7 +82,7 @@ def main() -> None:
     if not _has_google_tokens():
         auth_url = _google_auth_url()
         print("[auth] Google is not connected yet.")
-        print(f"[auth] Start API server: python -m uvicorn src.api.server:app --port 8000")
+        print("[auth] Start API server: python -m uvicorn src.api.server:app --port 8000")
         print(f"[auth] Connect here: {auth_url}")
         if args.open_auth_link:
             try:

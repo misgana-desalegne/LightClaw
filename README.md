@@ -3,8 +3,7 @@
 Lightweight, extensible AI agent system for personal productivity workflows:
 - Manage calendar (create, update, delete, conflict checks, reminders)
 - Read and classify emails (summaries, action-item extraction)
-- Search events/web and suggest options
-- Update calendar from email and event search outcomes
+- Update calendar from extracted email action items
 
 ## Phase 1: Architecture
 
@@ -12,8 +11,8 @@ Lightweight, extensible AI agent system for personal productivity workflows:
 - `Orchestrator`: routes intents to skills and coordinates cross-skill flows
 - `SkillRegistry`: plugin-style registration and intent-based resolution
 - `Context`: shared state/memory for current session
-- `Skills`: focused business logic per domain (`calendar`, `email`, `events`)
-- `Integrations`: provider adapters (currently mock/in-memory stubs)
+- `Skills`: focused business logic per domain (`calendar`, `email`)
+- `Integrations`: provider adapters (Google Calendar, Gmail)
 - `Schemas`: typed models with Pydantic for requests/results/entities
 
 ### Folder structure
@@ -27,13 +26,11 @@ src/
    integrations/
       gmail.py
       google_calendar.py
-      web_search.py
    models/
       schemas.py
    skills/
       calendar/skill.py
       email/skill.py
-      events/skill.py
    utils/
       logger.py
 tests/
@@ -48,23 +45,24 @@ tests/
 - Retries and failure-safe `SkillResult`
 - Built-in multi-skill workflows:
    - "Summarize my unread emails and add action items to calendar"
-   - "Find AI events this weekend and schedule the best option"
 
 ### Skills
 - `CalendarSkill`: create/update/delete/list, conflict checks, scheduling action items
 - `EmailSkill`: unread summary, basic classification, action-item extraction
-- `EventsSkill`: event search and best-option selection
 
-### Integration stubs (replaceable)
-- `CalendarProvider`: in-memory event store with overlap detection
-- `GmailProvider`: mock unread inbox data
-- `WebSearchProvider`: mock event suggestions
-- `LLMProvider`: `mock`, `ollama`, or OpenAI-compatible backends
+### Integrations
+- `CalendarProvider`: Google Calendar API (in-memory fallback for testing)
+- `GmailProvider`: Gmail API for unread inbox
+- `LLMProvider`: Gemini (via google-genai SDK)
 - `WhatsAppProvider`: message channel adapter for command intake/response
+- `TelegramProvider`: Telegram Bot API adapter for inbound/outbound chat
+- `WebChatProvider`: built-in local webchat adapter
 
 ### FastAPI automation layer
 - Google OAuth connect/callback endpoints for automatic credential persistence
 - WhatsApp webhook endpoints for Twilio and Meta Cloud API
+- Telegram webhook endpoint
+- Built-in webchat page and message endpoint
 - Token persistence in `.runtime_tokens.json` (configurable via `TOKEN_STORE_PATH`)
 
 ## Setup (Windows-friendly)
@@ -89,10 +87,6 @@ Copy-Item .env.example .env
 python -m src.main "Summarize my unread emails and add action items to calendar"
 ```
 
-```powershell
-python -m src.main "Find AI events this weekend and schedule the best option"
-```
-
 Run API server:
 ```powershell
 uvicorn src.api.server:app --reload --port 8000
@@ -101,6 +95,11 @@ uvicorn src.api.server:app --reload --port 8000
 Open admin UI:
 ```text
 http://localhost:8000/admin
+```
+
+Open built-in webchat:
+```text
+http://localhost:8000/chat
 ```
 
 WhatsApp-style command (creates task/event via LLM parsing):
@@ -137,11 +136,31 @@ pytest -q
    - POST `http://localhost:8000/webhooks/whatsapp/twilio`
 
 Set provider mode in `.env`:
-- `WHATSAPP_PROVIDER=mock` for local tests
 - `WHATSAPP_PROVIDER=twilio` with `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_NUMBER`
 - `WHATSAPP_PROVIDER=meta` with `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_VERIFY_TOKEN`
 
 You can also configure WhatsApp credentials from the admin page forms (`/admin`) and they are persisted in `.runtime_tokens.json`.
+
+### Telegram webhook
+- Endpoint:
+   - POST `http://localhost:8000/webhooks/telegram`
+- Configure credentials in `.env` or from `/admin`:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_WEBHOOK_SECRET` (optional but recommended)
+
+#### Telegram review mode (before calendar save)
+- For Telegram, `email_to_calendar` requests are collected first and sent back as numbered candidates.
+- Nothing is saved to calendar until you confirm in chat.
+- Reply commands:
+   - `keep 1,3` → save only selected items
+   - `disregard 2` → remove item(s) from pending list
+   - `keep all` / `approve all` → save all pending items
+   - `show` → reprint current review list
+   - `cancel` → discard everything pending
+
+### Webchat
+- Open `http://localhost:8000/chat`
+- Send commands in plain language (same command style as CLI/WhatsApp)
 
 ## LLM + local model setup
 
@@ -169,11 +188,14 @@ LLM_API_KEY=your_key_here
 ## Phase 6: Extension points for new skills
 
 1. Create `src/skills/<new_skill>/skill.py` with:
-    - `name`
+   - `name`, `version`, `description`, `actions`, `required_env`
     - `can_handle(intent: str) -> bool`
     - `execute(action: str, payload: dict, context: Context) -> SkillResult`
+   - `create_skill(dependencies: dict[str, Any]) -> Skill`
 2. Add provider adapter under `src/integrations/` if needed.
-3. Register skill in `bootstrap_orchestrator()` in `src/main.py`.
-4. Add tests in `tests/test_skills.py` and optional orchestration tests.
+3. Skill modules are auto-discovered from `src/skills/*/skill.py` by the loader.
+4. Optionally disable any skill at startup with `SKILLS_DISABLED=skill_name_1,skill_name_2`.
+5. Manage skill enable/disable at runtime via admin UI or API (`/admin/skills`).
+6. Add tests in `tests/test_skills.py` and optional orchestration tests.
 
 This keeps runtime lightweight while allowing incremental skill growth.

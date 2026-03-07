@@ -14,21 +14,23 @@ from src.integrations.token_store import get_token
 
 class CalendarProvider:
     def __init__(self) -> None:
-        self._access_token = self._resolve_access_token()
-        running_pytest = bool(os.getenv("PYTEST_CURRENT_TEST"))
-        self._use_google_api = bool(self._access_token) and not running_pytest
         self.last_error: str | None = None
         self._events: dict[str, CalendarEvent] = {}
 
+    def _use_google_api(self) -> bool:
+        """Check if Google API should be used (has tokens and not in test)."""
+        running_pytest = bool(os.getenv("PYTEST_CURRENT_TEST"))
+        return bool(self._resolve_access_token()) and not running_pytest
+
     def list_events(self) -> list[CalendarEvent]:
-        if self._use_google_api:
+        if self._use_google_api():
             remote_events = self._list_events_google()
             if remote_events:
                 return remote_events
         return sorted(self._events.values(), key=lambda event: event.start_time)
 
     def create_event(self, event_data: dict) -> CalendarEvent:
-        if self._use_google_api:
+        if self._use_google_api():
             created = self._create_event_google(event_data)
             if created is not None:
                 return created
@@ -47,7 +49,7 @@ class CalendarProvider:
         return event
 
     def update_event(self, event_id: str, updates: dict) -> CalendarEvent | None:
-        if self._use_google_api:
+        if self._use_google_api():
             updated = self._update_event_google(event_id, updates)
             if updated is not None:
                 return updated
@@ -65,7 +67,7 @@ class CalendarProvider:
         return updated
 
     def delete_event(self, event_id: str) -> bool:
-        if self._use_google_api and self._delete_event_google(event_id):
+        if self._use_google_api() and self._delete_event_google(event_id):
             return True
         return self._events.pop(event_id, None) is not None
 
@@ -219,38 +221,42 @@ class CalendarProvider:
         return result == {} or isinstance(result, dict)
 
     def _resolve_access_token(self) -> str | None:
-        direct_access_token = os.getenv("GOOGLE_CALENDAR_ACCESS_TOKEN") or get_token("GOOGLE_CALENDAR_ACCESS_TOKEN")
-        if direct_access_token:
-            return direct_access_token
-
         refresh_token = os.getenv("GOOGLE_CALENDAR_REFRESH_TOKEN") or get_token("GOOGLE_CALENDAR_REFRESH_TOKEN")
-        client_id = os.getenv("GOOGLE_CALENDAR_CLIENT_ID") or os.getenv("GOOGLE_OAUTH_CLIENT_ID")
-        client_secret = os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET") or os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
-        if not (refresh_token and client_id and client_secret):
-            return None
+        if refresh_token:
+            client_pairs = [
+                (os.getenv("GOOGLE_OAUTH_CLIENT_ID"), os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")),
+                (os.getenv("GOOGLE_CALENDAR_CLIENT_ID"), os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET")),
+                (os.getenv("GMAIL_CLIENT_ID"), os.getenv("GMAIL_CLIENT_SECRET")),
+            ]
+            for client_id, client_secret in client_pairs:
+                if not (client_id and client_secret):
+                    continue
+                refresh_payload = urlencode(
+                    {
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "refresh_token": refresh_token,
+                        "grant_type": "refresh_token",
+                    }
+                ).encode("utf-8")
+                request = Request(
+                    "https://oauth2.googleapis.com/token",
+                    data=refresh_payload,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
 
-        refresh_payload = urlencode(
-            {
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
-            }
-        ).encode("utf-8")
-        request = Request(
-            "https://oauth2.googleapis.com/token",
-            data=refresh_payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
+                try:
+                    with urlopen(request, timeout=15) as response:
+                        token_response = json.loads(response.read().decode("utf-8"))
+                    refreshed_access_token = token_response.get("access_token")
+                    if refreshed_access_token:
+                        return refreshed_access_token
+                except (URLError, TimeoutError, json.JSONDecodeError):
+                    continue
 
-        try:
-            with urlopen(request, timeout=15) as response:
-                token_response = json.loads(response.read().decode("utf-8"))
-        except (URLError, TimeoutError, json.JSONDecodeError):
-            return None
-
-        return token_response.get("access_token")
+        # Fallback to direct token if refresh is unavailable or fails.
+        return os.getenv("GOOGLE_CALENDAR_ACCESS_TOKEN") or get_token("GOOGLE_CALENDAR_ACCESS_TOKEN")
 
     @staticmethod
     def _http_json(method: str, url: str, access_token: str, payload: dict | None = None) -> dict:

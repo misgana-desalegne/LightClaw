@@ -5,8 +5,6 @@ import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 
 class LLMProvider(ABC):
@@ -16,129 +14,80 @@ class LLMProvider(ABC):
 
 
 class MockLLMProvider(LLMProvider):
+    """Minimal mock for testing. Returns basic fixtures based on prompt keywords."""
+    
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         prompt = user_prompt.lower()
         now = datetime.now().replace(second=0, microsecond=0)
 
+        # Email action items extraction
         if "extract action items" in system_prompt.lower():
-            due = None
-            if "monday" in prompt:
-                due = (now + timedelta(days=(0 - now.weekday()) % 7)).replace(hour=10, minute=0).isoformat()
-            elif "friday" in prompt:
-                due = (now + timedelta(days=(4 - now.weekday()) % 7)).replace(hour=10, minute=0).isoformat()
-            return {
-                "items": [
-                    {
-                        "title": "Follow up on email request",
-                        "due_at": due,
-                    }
-                ]
-            }
+            return {"items": [{"title": "Follow up on email request", "due_at": None}]}
 
-        if "rank events" in system_prompt.lower():
-            return {"best_index": 0}
-
-        if "parse whatsapp command" in system_prompt.lower():
-            if "add task" in prompt:
-                title = user_prompt.split("add task", 1)[1].strip() if "add task" in prompt else "New task"
+        # Intent classification (for tests) - detect via user_prompt containing "classify"
+        if "classify" in prompt or "intent" in prompt:
+            # Extract user message from formatted prompt
+            user_msg = prompt.split("user message:")[-1].strip().lower() if "user message:" in prompt else prompt
+            
+            # Check day - see both calendar and emails
+            if any(kw in user_msg for kw in ["check my day", "check day", "my day", "today's schedule", "what's on"]):
+                return {"intent": "check_day", "skill": None, "action": None, "payload": {}, "confidence": 0.95, "reasoning": "Check day overview"}
+            
+            # Today's calendar
+            if "today" in user_msg and ("calendar" in user_msg or "schedule" in user_msg or "events" in user_msg):
+                return {"intent": "calendar_today", "skill": "calendar", "action": "list_today", "payload": {}, "confidence": 0.9, "reasoning": "Today's calendar"}
+            
+            # Today's emails
+            if "today" in user_msg and "email" in user_msg:
+                return {"intent": "review_email_today", "skill": "email", "action": "summarize_today", "payload": {}, "confidence": 0.9, "reasoning": "Today's emails"}
+            
+            if any(kw in user_msg for kw in ["add task", "schedule task", "meeting", "lunch", "dinner"]):
                 start = (now + timedelta(hours=1)).isoformat()
-                end = (now + timedelta(hours=1, minutes=30)).isoformat()
+                end = (now + timedelta(hours=2)).isoformat()
                 return {
                     "intent": "calendar_create",
-                    "payload": {
-                        "title": f"Task: {title or 'New task'}",
-                        "start_time": start,
-                        "end_time": end,
-                    },
+                    "skill": "calendar",
+                    "action": "create",
+                    "payload": {"title": "Event", "start_time": start, "end_time": end},
+                    "confidence": 0.9,
+                    "reasoning": "User wants to create calendar event",
                 }
-            if "add event" in prompt or "schedule" in prompt:
-                start = (now + timedelta(hours=2)).isoformat()
-                end = (now + timedelta(hours=3)).isoformat()
-                return {
-                    "intent": "calendar_create",
-                    "payload": {
-                        "title": "New event",
-                        "start_time": start,
-                        "end_time": end,
-                    },
-                }
-            return {"intent": "fallback", "payload": {}}
+            if "email" in user_msg or "inbox" in user_msg:
+                return {"intent": "review_email", "skill": "email", "action": "summarize", "payload": {}, "confidence": 0.9, "reasoning": "Email review"}
+            return {"intent": "fallback", "skill": None, "action": None, "payload": {}, "confidence": 0.3, "reasoning": "Unknown"}
 
         return {"result": "ok"}
 
 
-class OpenAICompatibleLLMProvider(LLMProvider):
-    def __init__(self, base_url: str, model: str, api_key: str, timeout: float = 15.0) -> None:
-        self.base_url = base_url.rstrip("/")
+class GeminiLLMProvider(LLMProvider):
+    """Google Gemini API provider using official SDK."""
+    
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash") -> None:
+        from google import genai
+        self.client = genai.Client(api_key=api_key)
         self.model = model
-        self.api_key = api_key
-        self.timeout = timeout
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
-        payload = {
-            "model": self.model,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.1,
-        }
-        request = Request(
-            url=f"{self.base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
+        prompt = f"{system_prompt}\n\nUser message: {user_prompt}\n\nRespond with valid JSON only."
+        
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except (URLError, TimeoutError, json.JSONDecodeError):
-            return {"error": "llm_request_failed"}
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+            )
+            content = response.text
+        except Exception as e:
+            return {"error": "llm_request_failed", "details": str(e)}
 
-        content = (
-            body.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "{}")
-        )
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            return {"error": "llm_invalid_json", "raw": content}
-
-
-class OllamaLLMProvider(LLMProvider):
-    def __init__(self, base_url: str, model: str, timeout: float = 15.0) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.timeout = timeout
-
-    def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
-        payload = {
-            "model": self.model,
-            "format": "json",
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        request = Request(
-            url=f"{self.base_url}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except (URLError, TimeoutError, json.JSONDecodeError):
-            return {"error": "llm_request_failed"}
-
-        content = body.get("message", {}).get("content", "{}")
+        # Clean up markdown code blocks if present
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
         try:
             return json.loads(content)
         except json.JSONDecodeError:
@@ -146,18 +95,10 @@ class OllamaLLMProvider(LLMProvider):
 
 
 def build_llm_provider_from_env() -> LLMProvider:
-    backend = os.getenv("LLM_BACKEND", "mock").lower()
-    model = os.getenv("LLM_MODEL", "qwen2.5:7b-instruct")
-    base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434")
+    """Build LLM provider based on environment. Defaults to Gemini if API key present."""
     api_key = os.getenv("LLM_API_KEY", "")
-
-    if backend == "openai":
-        openai_url = base_url or "https://api.openai.com/v1"
-        if not api_key:
-            return MockLLMProvider()
-        return OpenAICompatibleLLMProvider(base_url=openai_url, model=model, api_key=api_key)
-
-    if backend == "ollama":
-        return OllamaLLMProvider(base_url=base_url, model=model)
-
+    model = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+    
+    if api_key:
+        return GeminiLLMProvider(api_key=api_key, model=model)
     return MockLLMProvider()

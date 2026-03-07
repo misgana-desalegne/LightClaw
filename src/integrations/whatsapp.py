@@ -13,7 +13,7 @@ from src.integrations.token_store import get_token
 
 class WhatsAppProvider:
     def __init__(self) -> None:
-        self.mode = (os.getenv("WHATSAPP_PROVIDER") or get_token("WHATSAPP_PROVIDER") or "mock").lower()
+        self.mode = (os.getenv("WHATSAPP_PROVIDER") or get_token("WHATSAPP_PROVIDER") or "twilio").lower()
         self._outbox: list[dict[str, Any]] = []
 
     def normalize_incoming(self, text: str, sender: str) -> dict[str, Any]:

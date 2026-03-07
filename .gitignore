@@ -12,6 +12,10 @@ venv/
 # Local env and runtime secrets
 .env
 .runtime_tokens.json
+.secrets.baseline
 
 # VS Code
 .vscode/*.log
+
+# Pre-commit local artifacts
+.pre-commit-config.local.yaml

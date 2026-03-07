@@ -42,11 +42,3 @@ class ActionItem(BaseModel):
     title: str
     due_at: datetime | None = None
     source_email_id: str | None = None
-
-
-class EventSuggestion(BaseModel):
-    title: str
-    start_time: datetime
-    end_time: datetime
-    location: str | None = None
-    source_url: str | None = None
