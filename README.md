@@ -1,5 +1,4 @@
-# Lightweight AI Agent (Skill-Focused)
-
+# Lightweight AI Agent 
 Lightweight, extensible AI agent system for personal productivity workflows:
 - Manage calendar (create, update, delete, conflict checks, reminders)
 - Read and classify emails (summaries, action-item extraction)
@@ -53,7 +52,7 @@ tests/
 ### Integrations
 - `CalendarProvider`: Google Calendar API (in-memory fallback for testing)
 - `GmailProvider`: Gmail API for unread inbox
-- `LLMProvider`: Gemini (via google-genai SDK)
+- `LLMProvider`: selectable backend (`gemini`, `ollama`, `openai`, `mock`)
 - `WhatsAppProvider`: message channel adapter for command intake/response
 - `TelegramProvider`: Telegram Bot API adapter for inbound/outbound chat
 - `WebChatProvider`: built-in local webchat adapter
@@ -162,6 +161,14 @@ You can also configure WhatsApp credentials from the admin page forms (`/admin`)
 - Open `http://localhost:8000/chat`
 - Send commands in plain language (same command style as CLI/WhatsApp)
 
+### LLM model choice from Admin
+- Open `http://localhost:8000/admin`
+- In the **LLM Model** card choose backend + model and save.
+- Settings are persisted and applied immediately.
+- Examples:
+   - Local Mistral via Ollama: backend `ollama`, model `mistral:7b-instruct`, base URL `http://localhost:11434`
+   - Gemini cloud: backend `gemini`, model `gemini-2.5-flash`, set `LLM_API_KEY`
+
 ## LLM + local model setup
 
 ### Local (Ollama)
@@ -172,7 +179,7 @@ ollama pull qwen2.5:7b-instruct
 Set in `.env`:
 ```dotenv
 LLM_BACKEND=ollama
-LLM_MODEL=qwen2.5:7b-instruct
+LLM_MODEL=mistral:7b-instruct
 LLM_BASE_URL=http://localhost:11434
 ```
 

@@ -100,6 +100,7 @@ def root() -> dict[str, Any]:
             "health": "/health",
             "admin": "/admin",
             "admin_skills": "/admin/skills",
+            "admin_llm_config": "/admin/llm/config",
             "webchat_ui": "/chat",
             "webchat_message": "/webchat/message",
             "google_auth_start": "/auth/google/start?services=gmail,calendar&redirect=true",
@@ -136,6 +137,9 @@ def _connected(service: str) -> bool:
 def admin_page(message: str | None = Query(default=None)) -> HTMLResponse:
     google_connected = _connected("gmail") and _connected("calendar")
     telegram_connected = _connected("telegram")
+    llm_backend = (os.getenv("LLM_BACKEND") or get_token("LLM_BACKEND") or "gemini").strip().lower()
+    llm_model = (os.getenv("LLM_MODEL") or get_token("LLM_MODEL") or "gemini-2.5-flash").strip()
+    llm_base_url = (os.getenv("LLM_BASE_URL") or get_token("LLM_BASE_URL") or "").strip()
 
     not_configured = "Not configured"
     status_google = "Connected" if google_connected else "Not connected"
@@ -314,6 +318,27 @@ def admin_page(message: str | None = Query(default=None)) -> HTMLResponse:
                 <div class='status'>Status: <span class='{"ok" if telegram_connected else ""}'>{status_telegram}</span></div>
                 {telegram_action_html}
                 <div class='muted'>Webhook URL: /webhooks/telegram</div>
+            </div>
+
+            <div class='card'>
+                <h3>LLM Model</h3>
+                <div class='status'>Choose cloud or local model backend for intent parsing and summaries.</div>
+                <form method='post' action='/admin/llm/config'>
+                    <div class='row'>
+                        <label>Backend</label>
+                        <select name='backend'>
+                            <option value='gemini' {"selected" if llm_backend == "gemini" else ""}>Gemini (cloud)</option>
+                            <option value='ollama' {"selected" if llm_backend == "ollama" else ""}>Ollama (local)</option>
+                            <option value='openai' {"selected" if llm_backend == "openai" else ""}>OpenAI-compatible</option>
+                            <option value='mock' {"selected" if llm_backend == "mock" else ""}>Mock (offline test)</option>
+                        </select>
+                    </div>
+                    <div class='row'><label>Model</label><input name='model' value='{escape(llm_model)}' placeholder='e.g. mistral:7b-instruct or gemini-2.5-flash' /></div>
+                    <div class='row'><label>Base URL (for Ollama/OpenAI-compatible)</label><input name='base_url' value='{escape(llm_base_url)}' placeholder='http://localhost:11434 or https://api.openai.com/v1' /></div>
+                    <div class='row'><label>API Key (required for Gemini/OpenAI-compatible)</label><input name='api_key' type='password' autocomplete='off' /></div>
+                    <button type='submit'>Save LLM Settings</button>
+                </form>
+                <div class='muted'>Tip: for local Mistral via Ollama use backend=ollama, model=mistral:7b-instruct.</div>
             </div>
 
             <div class='card'>
@@ -506,6 +531,40 @@ def telegram_configure(
     upsert_tokens(updates)
     os.environ.update({key: str(value) for key, value in updates.items() if value})
     return RedirectResponse(url="/admin?message=Telegram+configured", status_code=303)
+
+
+@app.post("/admin/llm/config")
+def llm_configure(
+    backend: Annotated[str, Form()],
+    model: Annotated[str, Form()] = "",
+    base_url: Annotated[str, Form()] = "",
+    api_key: Annotated[str, Form()] = "",
+) -> RedirectResponse:
+    global orchestrator
+
+    backend_value = backend.strip().lower() or "gemini"
+    if backend_value not in {"gemini", "ollama", "openai", "mock"}:
+        return RedirectResponse(url="/admin?message=Unsupported+LLM+backend", status_code=303)
+
+    updates: dict[str, str] = {
+        "LLM_BACKEND": backend_value,
+        "LLM_MODEL": model.strip(),
+        "LLM_BASE_URL": base_url.strip(),
+    }
+    if api_key.strip():
+        updates["LLM_API_KEY"] = api_key.strip()
+
+    upsert_tokens(updates)
+
+    # Keep environment in sync so subsequent provider construction sees new values.
+    for key, value in updates.items():
+        if value:
+            os.environ[key] = value
+        elif key in os.environ:
+            os.environ.pop(key, None)
+
+    orchestrator = bootstrap_orchestrator()
+    return RedirectResponse(url="/admin?message=LLM+settings+updated", status_code=303)
 
 
 @app.get("/auth/google/start", response_model=None, responses={400: {"description": "Missing OAuth client id"}})

@@ -5,6 +5,8 @@ import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 
 class LLMProvider(ABC):
@@ -94,11 +96,109 @@ class GeminiLLMProvider(LLMProvider):
             return {"error": "llm_invalid_json", "raw": content}
 
 
+class OpenAICompatibleLLMProvider(LLMProvider):
+    """OpenAI-compatible chat completions endpoint provider."""
+
+    def __init__(self, base_url: str, model: str, api_key: str, timeout: float = 20.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        payload = {
+            "model": self.model,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+        }
+        request = Request(
+            url=f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except (URLError, TimeoutError, json.JSONDecodeError):
+            return {"error": "llm_request_failed"}
+
+        content = body.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return {"error": "llm_invalid_json", "raw": content}
+
+
+class OllamaLLMProvider(LLMProvider):
+    """Local Ollama chat endpoint provider."""
+
+    def __init__(self, base_url: str, model: str, timeout: float = 20.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+
+    def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        payload = {
+            "model": self.model,
+            "format": "json",
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        request = Request(
+            url=f"{self.base_url}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except (URLError, TimeoutError, json.JSONDecodeError):
+            return {"error": "llm_request_failed"}
+
+        content = body.get("message", {}).get("content", "{}")
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return {"error": "llm_invalid_json", "raw": content}
+
+
 def build_llm_provider_from_env() -> LLMProvider:
-    """Build LLM provider based on environment. Defaults to Gemini if API key present."""
+    """Build LLM provider from env selection with safe fallback to mock."""
+    backend = os.getenv("LLM_BACKEND", "gemini").strip().lower()
     api_key = os.getenv("LLM_API_KEY", "")
     model = os.getenv("LLM_MODEL", "gemini-2.5-flash")
-    
-    if api_key:
+    base_url = os.getenv("LLM_BASE_URL", "").strip()
+
+    if backend == "mock":
+        return MockLLMProvider()
+
+    if backend == "gemini":
+        if not api_key:
+            return MockLLMProvider()
         return GeminiLLMProvider(api_key=api_key, model=model)
+
+    if backend == "ollama":
+        ollama_model = model or "qwen2.5:7b-instruct"
+        ollama_base_url = base_url or "http://localhost:11434"
+        return OllamaLLMProvider(base_url=ollama_base_url, model=ollama_model)
+
+    if backend == "openai":
+        if not api_key:
+            return MockLLMProvider()
+        openai_model = model or "gpt-4.1-mini"
+        openai_base_url = base_url or "https://api.openai.com/v1"
+        return OpenAICompatibleLLMProvider(base_url=openai_base_url, model=openai_model, api_key=api_key)
+
     return MockLLMProvider()
