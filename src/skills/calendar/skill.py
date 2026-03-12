@@ -76,12 +76,19 @@ class CalendarSkill:
             event = self.provider.create_event(normalized_payload)
         except Exception as error:  # noqa: BLE001
             return SkillResult(success=False, skill=self.name, action="create", message=self._humanize_provider_error(error))
+        
         context.append_memory("calendar_events", event.model_dump(mode="json"))
+        
+        # Format the success message with event details for Telegram
+        formatted_date = start.strftime("%B %d, %Y")
+        formatted_time = start.strftime("%I:%M %p").lstrip("0")
+        success_message = f"📅 Calendar event created: '{event.title}' on {formatted_date} at {formatted_time}"
+        
         return SkillResult(
             success=True,
             skill=self.name,
             action="create",
-            message="Event created",
+            message=success_message,
             data={"event": event.model_dump(mode="json")},
         )
 

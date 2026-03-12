@@ -1,0 +1,30 @@
+[Unit]
+Description=LightClaw Video Pipeline Automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=misgun
+WorkingDirectory=/home/misgun/LightClaw
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="GOOGLE_OAUTH_CLIENT_ID=your-client-id"
+Environment="GOOGLE_OAUTH_CLIENT_SECRET=your-client-secret"
+
+# Main automation script
+ExecStart=/usr/bin/python3 /home/misgun/LightClaw/automation_pipeline.py
+
+# Restart policy
+Restart=on-failure
+RestartSec=60
+
+# Logging
+StandardOutput=append:/home/misgun/LightClaw/logs/automation_stdout.log
+StandardError=append:/home/misgun/LightClaw/logs/automation_stderr.log
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

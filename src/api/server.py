@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
 import time
 from html import escape
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -129,6 +131,11 @@ def _connected(service: str) -> bool:
             os.getenv("TELEGRAM_BOT_TOKEN")
             or get_token("TELEGRAM_BOT_TOKEN")
         )
+    if service == "youtube":
+        return bool(
+            os.getenv("YOUTUBE_API_KEY")
+            or get_token("YOUTUBE_API_KEY")
+        )
     return False
 
 
@@ -136,10 +143,18 @@ def _connected(service: str) -> bool:
 def admin_page(message: str | None = Query(default=None)) -> HTMLResponse:
     google_connected = _connected("gmail") and _connected("calendar")
     telegram_connected = _connected("telegram")
+    youtube_connected = _connected("youtube")
+    facebook_configured = bool(os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN") and os.getenv("FACEBOOK_PAGE_ID"))
+    instagram_configured = bool(os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID") and os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN"))
+    cdn_backend = os.getenv("CDN_BACKEND", "local")
 
     not_configured = "Not configured"
     status_google = "Connected" if google_connected else "Not connected"
     status_telegram = "Configured" if telegram_connected else not_configured
+    status_youtube = "Connected" if youtube_connected else "Not connected"
+    status_facebook = "Configured" if facebook_configured else not_configured
+    status_instagram = "Configured" if instagram_configured else not_configured
+    status_cdn = f"Active ({cdn_backend})"
     google_action_html = (
         """
         <div class='action-row'>
@@ -171,6 +186,53 @@ def admin_page(message: str | None = Query(default=None)) -> HTMLResponse:
                 </form>
         """
     )
+    
+    youtube_action_html = (
+        """
+        <div class='action-row'>
+            <button class='button connected' type='button' disabled>YouTube Connected</button>
+            <a class='button secondary' href='/auth/google/start?services=youtube&redirect=true'>Reconnect YouTube</a>
+        </div>
+        """
+        if youtube_connected
+        else "<a class='button' href='/auth/google/start?services=youtube&redirect=true'>Connect YouTube</a>"
+    )
+    
+    facebook_action_html = """
+        <form method='post' action='/auth/facebook/config'>
+            <div class='row'><label>Page Access Token</label><input name='page_access_token' type='password' required /></div>
+            <div class='row'><label>Page ID</label><input name='page_id' required /></div>
+            <div class='row'><label>App ID (optional)</label><input name='app_id' /></div>
+            <div class='row'><label>App Secret (optional)</label><input name='app_secret' type='password' /></div>
+            <button type='submit'>Save Facebook Credentials</button>
+        </form>
+    """
+    
+    instagram_action_html = """
+        <form method='post' action='/auth/instagram/config'>
+            <div class='row'><label>Business Account ID</label><input name='account_id' required /></div>
+            <div class='muted' style='margin-top:-5px;'>Use same Page Access Token as Facebook</div>
+            <button type='submit'>Save Instagram Credentials</button>
+        </form>
+    """
+    
+    cdn_action_html = f"""
+        <form method='post' action='/auth/cdn/config'>
+            <div class='row'>
+                <label>CDN Backend</label>
+                <select name='cdn_backend'>
+                    <option value='local' {'selected' if cdn_backend == 'local' else ''}>Local Server (Testing)</option>
+                    <option value='s3' {'selected' if cdn_backend == 's3' else ''}>AWS S3 (Production)</option>
+                    <option value='cloudflare' {'selected' if cdn_backend == 'cloudflare' else ''}>Cloudflare R2 (Production)</option>
+                </select>
+            </div>
+            <div class='row'><label>Server Port (local only)</label><input name='server_port' value='8080' placeholder='8080' /></div>
+            <div class='row'><label>S3 Bucket (S3/R2 only)</label><input name='s3_bucket' placeholder='my-videos-bucket' /></div>
+            <div class='row'><label>AWS Region (S3 only)</label><input name='aws_region' placeholder='us-east-1' /></div>
+            <button type='submit'>Save CDN Config</button>
+        </form>
+    """
+    
     message_html = (
         f"<div class='notice success'>{escape(message)}</div>" if message else ""
     )
@@ -280,47 +342,192 @@ def admin_page(message: str | None = Query(default=None)) -> HTMLResponse:
         .skill-toggle {{ background: #111827; }}
         .skill-toggle.enable {{ background: #166534; }}
         .skill-toggle.disable {{ background: #b91c1c; }}
+        
+        /* Tabs */
+        .tabs {{
+            display: flex;
+            gap: 8px;
+            margin-bottom: 24px;
+            border-bottom: 2px solid var(--border);
+        }}
+        .tab {{
+            padding: 12px 20px;
+            background: transparent;
+            border: none;
+            border-bottom: 3px solid transparent;
+            color: var(--muted);
+            cursor: pointer;
+            font-size: 15px;
+            font-weight: 600;
+            transition: all 0.2s;
+        }}
+        .tab:hover {{
+            color: var(--text);
+            background: #f3f4f6;
+        }}
+        .tab.active {{
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+        }}
+        .tab-content {{
+            display: none;
+        }}
+        .tab-content.active {{
+            display: block;
+        }}
+        .section-title {{
+            font-size: 22px;
+            margin: 0 0 8px;
+        }}
+        .tab-subtitle {{
+            color: var(--muted);
+            margin: 0 0 20px;
+            font-size: 14px;
+        }}
+        .pipeline-status {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }}
+        .pipeline-status h3 {{
+            color: white;
+        }}
+        .pipeline-status .status {{
+            color: rgba(255, 255, 255, 0.9);
+        }}
+        .pipeline-status .muted {{
+            color: rgba(255, 255, 255, 0.8);
+        }}
+        .pipeline-actions {{
+            display: flex;
+            gap: 8px;
+            margin: 12px 0;
+        }}
+        .pipeline-actions .button {{
+            background: rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(10px);
+        }}
+        .pipeline-actions .button:hover {{
+            background: rgba(255, 255, 255, 0.3);
+        }}
+        .pipeline-actions .button.secondary {{
+            background: rgba(0, 0, 0, 0.2);
+        }}
+        .pipeline-actions .button.secondary:hover {{
+            background: rgba(0, 0, 0, 0.3);
+        }}
+        a {{
+            color: var(--primary);
+            text-decoration: none;
+        }}
+        a:hover {{
+            text-decoration: underline;
+        }}
     </style>
 </head>
 <body>
     <div class='container'>
-        <h1 class='title'>Admin Authentication</h1>
-        <p class='subtitle'>Google and Webchat are required. WhatsApp and Telegram are optional channels.</p>
+        <h1 class='title'>🎬 LightClaw Admin</h1>
+        <p class='subtitle'>Manage integrations, social media, and automation pipeline</p>
         {message_html}
-        <div class='grid'>
-            <div class='card'>
-                <h3>Google (Gmail + Calendar)<span class='required'>Mandatory</span></h3>
-                <div class='status'>Status: <span class='{"ok" if google_connected else ""}'>{status_google}</span></div>
-                {google_action_html}
-                <div class='muted'>Uses OAuth consent and stores tokens automatically.</div>
-            </div>
+        
+        <div class='tabs'>
+            <button class='tab active' onclick='showTab("core")'>Core Services</button>
+            <button class='tab' onclick='showTab("social")'>Social Media</button>
+            <button class='tab' onclick='showTab("skills")'>Skills</button>
+        </div>
+        
+        <!-- Core Services Tab -->
+        <div id='tab-core' class='tab-content active'>
+            <h2 class='section-title'>Core Services</h2>
+            <div class='grid'>
+                <div class='card'>
+                    <h3>Google (Gmail + Calendar)<span class='required'>Required</span></h3>
+                    <div class='status'>Status: <span class='{"ok" if google_connected else ""}'>{status_google}</span></div>
+                    {google_action_html}
+                    <div class='muted'>Uses OAuth consent and stores tokens automatically.</div>
+                </div>
 
-            <div class='card'>
-                <h3>Webchat<span class='required'>Mandatory</span></h3>
-                <div class='status'>Status: <span class='ok'>Ready</span></div>
-                <div class='chat-wrap'>
-                    <div id='admin-chat-log' class='chat-log'></div>
-                    <div class='row'>
-                        <label>Type and press Enter</label>
-                        <input id='admin-chat-input' placeholder='add task prepare sprint demo' autocomplete='off' />
+                <div class='card'>
+                    <h3>Webchat<span class='required'>Required</span></h3>
+                    <div class='status'>Status: <span class='ok'>Ready</span></div>
+                    <div class='chat-wrap'>
+                        <div id='admin-chat-log' class='chat-log'></div>
+                        <div class='row'>
+                            <label>Type and press Enter</label>
+                            <input id='admin-chat-input' placeholder='add task prepare sprint demo' autocomplete='off' />
+                        </div>
+                    </div>
+                    <div class='muted'>No external auth required. Messages are sent directly from this page.</div>
+                </div>
+
+                <div class='card'>
+                    <h3>Telegram Bot</h3>
+                    <div class='status'>Status: <span class='{"ok" if telegram_connected else ""}'>{status_telegram}</span></div>
+                    {telegram_action_html}
+                    <div class='muted'>Webhook URL: /webhooks/telegram</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Social Media Tab -->
+        <div id='tab-social' class='tab-content'>
+            <h2 class='section-title'>Social Media Automation</h2>
+            <p class='tab-subtitle'>Configure platforms for automated video uploads</p>
+            <div class='grid'>
+                <div class='card'>
+                    <h3>🎥 YouTube<span class='required'>Required</span></h3>
+                    <div class='status'>Status: <span class='{"ok" if youtube_connected else ""}'>{status_youtube}</span></div>
+                    {youtube_action_html}
+                    <div class='muted'>OAuth 2.0 authentication for video uploads. Required for automation pipeline.</div>
+                </div>
+
+                <div class='card'>
+                    <h3>📱 Facebook Page</h3>
+                    <div class='status'>Status: <span class='{"ok" if facebook_configured else ""}'>{status_facebook}</span></div>
+                    {facebook_action_html}
+                    <div class='muted'>
+                        Get credentials from <a href='https://developers.facebook.com/' target='_blank'>Meta Developer Console</a>.<br>
+                        <a href='/docs/social-media' target='_blank'>Setup Guide</a>
                     </div>
                 </div>
-                <div class='muted'>No external auth required. Messages are sent directly from this page.</div>
-            </div>
 
+                <div class='card'>
+                    <h3>📷 Instagram</h3>
+                    <div class='status'>Status: <span class='{"ok" if instagram_configured else ""}'>{status_instagram}</span></div>
+                    {instagram_action_html}
+                    <div class='muted'>
+                        Requires Instagram Business Account linked to Facebook Page.<br>
+                        <a href='/docs/social-media#instagram' target='_blank'>Setup Guide</a>
+                    </div>
+                </div>
 
-            <div class='card'>
-                <h3>Telegram Bot</h3>
-                <div class='status'>Status: <span class='{"ok" if telegram_connected else ""}'>{status_telegram}</span></div>
-                {telegram_action_html}
-                <div class='muted'>Webhook URL: /webhooks/telegram</div>
+                <div class='card'>
+                    <h3>🌐 CDN / File Server</h3>
+                    <div class='status'>Status: <span class='ok'>{status_cdn}</span></div>
+                    {cdn_action_html}
+                    <div class='muted'>
+                        Instagram requires publicly accessible URLs.<br>
+                        Use local for testing, S3/R2 for production.
+                    </div>
+                </div>
+                
+                <div class='card pipeline-status'>
+                    <h3>⚙️ Pipeline Status</h3>
+                    <div id='pipeline-status' class='status'>Checking...</div>
+                    <div class='pipeline-actions'>
+                        <button class='button' onclick='testPipeline()'>Test Pipeline</button>
+                        <button class='button secondary' onclick='viewLogs()'>View Logs</button>
+                    </div>
+                    <div class='muted'>Run automation pipeline test to verify all integrations.</div>
+                </div>
             </div>
-
-            <div class='card'>
-                <h3>Skills</h3>
-                <div class='status'>Enable or disable registered skills without restarting.</div>
-                <div id='skills-list' class='skill-list'></div>
-            </div>
+        </div>
+        
+        <!-- Skills Tab -->
+        <div id='tab-skills' class='tab-content'>
+            <h2 class='section-title'>Skills Management</h2>
+            <p class='tab-subtitle'>Enable or disable skills without restarting the server</p>
+            <div id='skills-list' class='skill-list'></div>
         </div>
     </div>
     <script>
@@ -429,6 +636,67 @@ def admin_page(message: str | None = Query(default=None)) -> HTMLResponse:
         loadSkills();
         pollMessages();
         setInterval(pollMessages, 2000);
+        
+        // Tab switching
+        function showTab(tabName) {{
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+            
+            // Show selected tab
+            document.getElementById('tab-' + tabName).classList.add('active');
+            event.target.classList.add('active');
+        }}
+        
+        // Pipeline testing
+        async function testPipeline() {{
+            const statusEl = document.getElementById('pipeline-status');
+            statusEl.innerHTML = '<span style="color: #fbbf24;">⏳ Testing pipeline...</span>';
+            
+            try {{
+                const response = await fetch('/api/pipeline/test', {{ method: 'POST' }});
+                const data = await response.json();
+                
+                if (data.success) {{
+                    statusEl.innerHTML = '<span style="color: #10b981;">✅ Pipeline test passed!</span>';
+                }} else {{
+                    statusEl.innerHTML = '<span style="color: #ef4444;">❌ Test failed: ' + (data.error || 'Unknown error') + '</span>';
+                }}
+            }} catch (error) {{
+                statusEl.innerHTML = '<span style="color: #ef4444;">❌ Test failed: ' + error.message + '</span>';
+            }}
+        }}
+        
+        function viewLogs() {{
+            window.open('/logs', '_blank');
+        }}
+        
+        // Check pipeline status on load
+        async function checkPipelineStatus() {{
+            try {{
+                const response = await fetch('/api/pipeline/status');
+                const data = await response.json();
+                const statusEl = document.getElementById('pipeline-status');
+                
+                const platforms = [];
+                if (data.youtube) platforms.push('YouTube');
+                if (data.facebook) platforms.push('Facebook');
+                if (data.instagram) platforms.push('Instagram');
+                
+                if (platforms.length === 0) {{
+                    statusEl.innerHTML = '<span style="color: #ef4444;">❌ No platforms configured</span>';
+                }} else if (platforms.length === 3) {{
+                    statusEl.innerHTML = '<span style="color: #10b981;">✅ All platforms ready: ' + platforms.join(', ') + '</span>';
+                }} else {{
+                    statusEl.innerHTML = '<span style="color: #fbbf24;">⚠️ Partial: ' + platforms.join(', ') + '</span>';
+                }}
+            }} catch (error) {{
+                document.getElementById('pipeline-status').innerHTML = '<span style="color: #6b7280;">Status unavailable</span>';
+            }}
+        }}
+        
+        checkPipelineStatus();
+        setInterval(checkPipelineStatus, 10000); // Check every 10 seconds
     </script>
 </body>
 </html>
@@ -508,126 +776,161 @@ def telegram_configure(
     return RedirectResponse(url="/admin?message=Telegram+configured", status_code=303)
 
 
-@app.get("/auth/google/start", response_model=None, responses={400: {"description": "Missing OAuth client id"}})
-def google_auth_start(
-    services: Annotated[str, Query()] = "gmail,calendar",
-    redirect: Annotated[bool, Query()] = False,
-) -> JSONResponse | RedirectResponse:
-    _cleanup_expired_state()
-
-    requested_services = [item.strip().lower() for item in services.split(",") if item.strip()]
-    if not requested_services:
-        requested_services = ["gmail", "calendar"]
-
-    client_id = _oauth_client_id()
-    if not client_id:
-        raise HTTPException(status_code=400, detail="Missing GOOGLE_OAUTH_CLIENT_ID / GOOGLE_CALENDAR_CLIENT_ID / GMAIL_CLIENT_ID")
-
-    scope_map = {
-        "gmail": "https://www.googleapis.com/auth/gmail.modify",
-        "calendar": "https://www.googleapis.com/auth/calendar",
+@app.post("/auth/facebook/config")
+def facebook_configure(
+    page_access_token: Annotated[str, Form()],
+    page_id: Annotated[str, Form()],
+    app_id: Annotated[str, Form()] = "",
+    app_secret: Annotated[str, Form()] = "",
+) -> RedirectResponse:
+    updates = {
+        "FACEBOOK_PAGE_ACCESS_TOKEN": page_access_token,
+        "FACEBOOK_PAGE_ID": page_id,
     }
-    selected_scopes = [scope_map[service] for service in requested_services if service in scope_map]
-    if not selected_scopes:
-        selected_scopes = [scope_map["gmail"], scope_map["calendar"]]
-
-    state = secrets.token_urlsafe(24)
-    _OAUTH_STATE[state] = OAuthState(services=requested_services, created_at=time.time())
-
-    redirect_uri = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
-    params = urlencode(
-        {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "scope": " ".join(selected_scopes),
-            "access_type": "offline",
-            "prompt": "consent",
-            "include_granted_scopes": "true",
-            "state": state,
-        }
-    )
-    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{params}"
-
-    if redirect:
-        return RedirectResponse(auth_url)
-
-    return JSONResponse({"auth_url": auth_url, "state": state, "services": requested_services})
-
-
-@app.get("/auth/google/callback", responses={400: {"description": "Invalid OAuth request"}, 502: {"description": "OAuth exchange failed"}})
-def google_auth_callback(
-    code: Annotated[str, Query()],
-    state: Annotated[str, Query()],
-) -> dict[str, Any]:
-    _cleanup_expired_state()
-    state_data = _OAUTH_STATE.pop(state, None)
-    if state_data is None:
-        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
-
-    client_id = _oauth_client_id()
-    client_secret = _oauth_client_secret()
-    redirect_uri = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
-    if not client_id or not client_secret:
-        raise HTTPException(status_code=400, detail="Missing Google OAuth client credentials")
-
-    token_request_data = urlencode(
-        {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "grant_type": "authorization_code",
-            "redirect_uri": redirect_uri,
-        }
-    ).encode("utf-8")
-    request = Request(
-        url="https://oauth2.googleapis.com/token",
-        data=token_request_data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-
-    try:
-        with urlopen(request, timeout=20) as response:
-            token_payload = json.loads(response.read().decode("utf-8"))
-    except Exception as error:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"OAuth token exchange failed: {error}") from error
-
-    refresh_token = token_payload.get("refresh_token")
-    access_token = token_payload.get("access_token")
-    expires_in = token_payload.get("expires_in")
-
-    updates: dict[str, Any] = {
-        "GOOGLE_OAUTH_ACCESS_TOKEN": access_token,
-        "GOOGLE_OAUTH_REFRESH_TOKEN": refresh_token,
-        "GOOGLE_OAUTH_TOKEN_TYPE": token_payload.get("token_type"),
-        "GOOGLE_OAUTH_EXPIRES_IN": expires_in,
-    }
-
-    if "gmail" in state_data.services:
-        updates["GMAIL_ACCESS_TOKEN"] = access_token
-        if refresh_token:
-            updates["GMAIL_REFRESH_TOKEN"] = refresh_token
-
-    if "calendar" in state_data.services:
-        updates["GOOGLE_CALENDAR_ACCESS_TOKEN"] = access_token
-        if refresh_token:
-            updates["GOOGLE_CALENDAR_REFRESH_TOKEN"] = refresh_token
-
+    if app_id:
+        updates["FACEBOOK_APP_ID"] = app_id
+    if app_secret:
+        updates["FACEBOOK_APP_SECRET"] = app_secret
+    
     upsert_tokens(updates)
+    os.environ.update({key: str(value) for key, value in updates.items() if value})
+    return RedirectResponse(url="/admin?message=Facebook+configured", status_code=303)
 
+
+@app.post("/auth/instagram/config")
+def instagram_configure(
+    account_id: Annotated[str, Form()],
+) -> RedirectResponse:
+    updates = {
+        "INSTAGRAM_BUSINESS_ACCOUNT_ID": account_id,
+    }
+    upsert_tokens(updates)
+    os.environ.update({key: str(value) for key, value in updates.items() if value})
+    return RedirectResponse(url="/admin?message=Instagram+configured", status_code=303)
+
+
+@app.post("/auth/cdn/config")
+def cdn_configure(
+    cdn_backend: Annotated[str, Form()],
+    server_port: Annotated[str, Form()] = "8080",
+    s3_bucket: Annotated[str, Form()] = "",
+    aws_region: Annotated[str, Form()] = "us-east-1",
+) -> RedirectResponse:
+    updates = {
+        "CDN_BACKEND": cdn_backend,
+        "FILE_SERVER_PORT": server_port,
+    }
+    if s3_bucket:
+        updates["AWS_S3_BUCKET"] = s3_bucket
+        updates["CLOUDFLARE_R2_BUCKET"] = s3_bucket  # Can be used for both
+    if aws_region:
+        updates["AWS_REGION"] = aws_region
+    
+    upsert_tokens(updates)
+    os.environ.update({key: str(value) for key, value in updates.items() if value})
+    return RedirectResponse(url="/admin?message=CDN+configured", status_code=303)
+
+
+@app.get("/api/pipeline/status")
+def pipeline_status() -> dict[str, Any]:
+    """Get pipeline configuration status."""
     return {
-        "connected": state_data.services,
-        "token_saved": True,
-        "has_access_token": bool(access_token),
-        "has_refresh_token": bool(refresh_token),
-        "expires_in": expires_in,
+        "youtube": _connected("youtube"),
+        "facebook": bool(os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN") and os.getenv("FACEBOOK_PAGE_ID")),
+        "instagram": bool(os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID") and os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")),
+        "cdn_backend": os.getenv("CDN_BACKEND", "local"),
     }
 
 
+@app.post("/api/pipeline/test")
+def pipeline_test() -> dict[str, Any]:
+    """Test the automation pipeline configuration."""
+    try:
+        # Check YouTube
+        if not _connected("youtube"):
+            return {"success": False, "error": "YouTube not connected"}
+        
+        # Check if pipeline script exists
+        pipeline_path = Path("automation_pipeline.py")
+        if not pipeline_path.exists():
+            return {"success": False, "error": "Pipeline script not found"}
+        
+        # Try to import and check
+        import sys
+        sys.path.insert(0, str(Path.cwd()))
+        
+        # Basic validation
+        errors = []
+        
+        if not os.getenv("GOOGLE_OAUTH_CLIENT_ID"):
+            errors.append("Missing GOOGLE_OAUTH_CLIENT_ID")
+        
+        facebook_configured = bool(os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN") and os.getenv("FACEBOOK_PAGE_ID"))
+        instagram_configured = bool(os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID") and os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN"))
+        
+        platforms = ["YouTube"]
+        if facebook_configured:
+            platforms.append("Facebook")
+        if instagram_configured:
+            platforms.append("Instagram")
+        
+        if errors:
+            return {"success": False, "error": ", ".join(errors)}
+        
+        return {
+            "success": True,
+            "message": f"Pipeline ready for {', '.join(platforms)}",
+            "platforms": platforms
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
+@app.get("/logs", response_class=HTMLResponse)
+def view_logs() -> HTMLResponse:
+    """View automation logs."""
+    log_file = Path("logs/automation.log")
+    
+    if not log_file.exists():
+        content = "No logs found. Pipeline hasn't run yet."
+    else:
+        try:
+            # Read last 1000 lines
+            with open(log_file, 'r') as f:
+                lines = f.readlines()
+                content = ''.join(lines[-1000:])
+        except Exception as e:
+            content = f"Error reading logs: {e}"
+    
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pipeline Logs</title>
+    <style>
+        body {{ font-family: 'Courier New', monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; }}
+        .log-container {{ background: #252526; padding: 20px; border-radius: 8px; }}
+        .log-content {{ white-space: pre-wrap; word-wrap: break-word; font-size: 13px; line-height: 1.5; }}
+        .back-link {{ display: inline-block; margin-bottom: 15px; color: #4fc3f7; text-decoration: none; }}
+        .back-link:hover {{ text-decoration: underline; }}
+    </style>
+</head>
+<body>
+    <a href="/admin" class="back-link">← Back to Admin</a>
+    <div class="log-container">
+        <div class="log-content">{escape(content)}</div>
+    </div>
+</body>
+</html>
+"""
+    return HTMLResponse(html)
 
+
+@app.get("/docs/social-media", response_class=HTMLResponse)
+def social_media_docs() -> HTMLResponse:
+    """Redirect to social media documentation."""
+    return RedirectResponse(url="https://github.com/your-repo/blob/main/SOCIAL_MEDIA_INTEGRATION.md", status_code=303)
 
 
 @app.get("/chat", response_class=HTMLResponse)

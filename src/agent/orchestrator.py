@@ -10,19 +10,39 @@ from src.agent.registry import Skill, SkillRegistry
 from src.integrations.llm import LLMProvider
 from src.models.schemas import IntentRequest, SkillResult
 
-INTENT_PROMPT = """You are a productivity assistant. Classify the user's message and extract details.
+INTENT_PROMPT = """Classify user message into a specific action intent.
 
 Current datetime: {current_datetime}
 
-Return JSON with: intent (calendar_create | calendar_list | calendar_today | review_email | review_email_today | check_day | fallback), payload (title, start_time, end_time for calendar), reasoning.
+Return JSON: {{"intent": "intent_name", "payload": {{}}}}
 
-Rules:
-- For calendar_create: extract title, start_time (ISO 8601), end_time from natural language
-- "tomorrow at 2pm" = tomorrow's date at 14:00, default 1 hour duration
-- For calendar_today: show today's calendar events
-- For review_email: summarize last 10 emails
-- For review_email_today: summarize today's emails only
-- For check_day: check both today's emails and calendar events together
+Supported intents:
+- calendar_create: add event (extract title, start_time, end_time in ISO format YYYY-MM-DDTHH:MM:SS)
+- calendar_list: show all events
+- calendar_today: show today's events
+- review_email: summarize last 10 emails
+- review_email_today: summarize today's emails
+- check_day: show today's calendar and emails
+- email_reply: craft reply (extract email_text from message)
+- email_analyze: analyze email (extract email_text from message)
+- news_fetch: fetch latest news videos (extract category: news/tech/trending, max_results)
+- fallback: if no clear action
+
+Date/Time Extraction Rules:
+- "tomorrow" = add 1 day to current date
+- "13 march 2026" or "march 13 2026" = 2026-03-13
+- "6pm" = 18:00, "2pm" = 14:00, "9am" = 09:00
+- Default duration: 1 hour if end time not specified
+- Always use ISO format: YYYY-MM-DDTHH:MM:SS
+
+Examples:
+- "lunch tomorrow 2pm" → {{"intent": "calendar_create", "payload": {{"title": "lunch", "start_time": "2026-03-08T14:00:00", "end_time": "2026-03-08T15:00:00"}}}}
+- "Meeting with Marcus for 13 march 2026, 6pm" → {{"intent": "calendar_create", "payload": {{"title": "Meeting with Marcus", "start_time": "2026-03-13T18:00:00", "end_time": "2026-03-13T19:00:00"}}}}
+- "check my day" → {{"intent": "check_day", "payload": {{}}}}
+- "review email" → {{"intent": "review_email", "payload": {{}}}}
+- "fetch latest news" → {{"intent": "news_fetch", "payload": {{"category": "news", "max_results": 5}}}}
+- "get tech news" → {{"intent": "news_fetch", "payload": {{"category": "tech", "max_results": 5}}}}
+- "show trending videos" → {{"intent": "news_fetch", "payload": {{"category": "trending", "max_results": 10}}}}
 
 User message: {user_message}
 """
@@ -102,13 +122,37 @@ class Orchestrator:
             current_datetime=datetime.now().strftime("%Y-%m-%d %H:%M (%A)"),
             user_message=text,
         )
-        result = self.llm.generate_json(system_prompt="", user_prompt=prompt)
-        if not isinstance(result, dict):
+        
+        try:
+            result = self.llm.generate_json(system_prompt="", user_prompt=prompt)
+            self.logger.info(f"LLM raw result: {result}")
+        except Exception as e:
+            self.logger.error(f"LLM error: {e}")
             result = {}
+            
+        if not isinstance(result, dict):
+            self.logger.warning(f"LLM returned non-dict: {type(result)}")
+            result = {}
+            
+        # Check for error responses from LLM
+        if "error" in result:
+            self.logger.error(f"LLM error response: {result}")
+            # Try to match simple patterns as fallback
+            text_lower = text.lower()
+            if "check" in text_lower and "day" in text_lower:
+                return {"intent": "check_day", "payload": {}}
+            elif "review" in text_lower and "email" in text_lower:
+                return {"intent": "review_email", "payload": {}}
+            elif any(word in text_lower for word in ["news", "viral", "trending", "tech news"]):
+                category = "tech" if "tech" in text_lower else ("trending" if "trending" in text_lower else "news")
+                return {"intent": "news_fetch", "payload": {"category": category, "max_results": 5}}
+            elif any(word in text_lower for word in ["lunch", "meeting", "dinner", "event"]):
+                return {"intent": "calendar_create", "payload": {"title": text}}
+            return {"intent": "fallback", "payload": {}}
+            
         return {
             "intent": result.get("intent", "fallback"),
             "payload": result.get("payload", {}),
-            "reasoning": result.get("reasoning", ""),
         }
 
     def _execute_intent(self, classification: dict, sender: str, text: str) -> SkillResult:
@@ -118,7 +162,8 @@ class Orchestrator:
 
         # Calendar create - execute directly
         if intent == "calendar_create":
-            return self._create_calendar_event(payload, text)
+            result = self._create_calendar_event(payload, text)
+            return result
 
         # Calendar list
         if intent == "calendar_list":
@@ -133,15 +178,79 @@ class Orchestrator:
             return self._prepare_email_review(sender)
         if intent == "review_email_today":
             return self._summarize_today_emails()
+            
+        # Email analysis and reply crafting
+        if intent == "email_analyze":
+            return self._analyze_email(payload)
+        if intent == "email_reply":
+            return self._craft_email_reply(payload)
+            
         # Check day - show today's calendar and recent emails together
         if intent == "check_day":
             return self._check_day(sender)
+        
+        # News fetching
+        if intent == "news_fetch":
+            return self._fetch_news(payload)
 
         # Fallback
         return SkillResult(
-            success=True, skill="orchestrator", action="help",
-            message="I can help with:\n• 'lunch with John tomorrow at 2pm' → add to calendar\n• 'check my day' → see today's schedule + emails\n• 'review email' → check last 10 emails",
+            success=False,
+            skill="orchestrator",
+            action="fallback",
+            message="❌ Command not recognized. Try:\n• 'lunch tomorrow at 2pm'\n• 'check my day'\n• 'review email'\n• 'analyze this email: [text]'\n• 'craft reply to: [text]'",
         )
+
+    def _analyze_email(self, payload: dict) -> SkillResult:
+        """Analyze an email for sentiment, priority, and key points."""
+        email_text = payload.get("email_text", "")
+        if not email_text:
+            return SkillResult(
+                success=False, 
+                skill="orchestrator", 
+                action="email_analyze",
+                message="Please provide the email text to analyze. Example: 'analyze this email: [paste email content]'"
+            )
+            
+        email_skill = self.skill_registry.get_skill("email")
+        if not email_skill:
+            return SkillResult(
+                success=False, 
+                skill="orchestrator", 
+                action="email_analyze",
+                message="Email analysis unavailable - email skill not found"
+            )
+            
+        return email_skill.execute("analyze_email", {"email_text": email_text}, self.context)
+
+    def _craft_email_reply(self, payload: dict) -> SkillResult:
+        """Craft a professional reply to an email."""
+        email_text = payload.get("email_text", "")
+        tone = payload.get("tone", "professional")  # professional, friendly, brief
+        intent = payload.get("intent", "acknowledge")  # acknowledge, accept, decline, request_info
+        
+        if not email_text:
+            return SkillResult(
+                success=False, 
+                skill="orchestrator", 
+                action="email_reply",
+                message="Please provide the email text to reply to. Example: 'craft reply to: [paste email content]'"
+            )
+            
+        email_skill = self.skill_registry.get_skill("email")
+        if not email_skill:
+            return SkillResult(
+                success=False, 
+                skill="orchestrator", 
+                action="email_reply",
+                message="Email reply unavailable - email skill not found"
+            )
+            
+        return email_skill.execute("craft_reply", {
+            "email_text": email_text, 
+            "tone": tone, 
+            "intent": intent
+        }, self.context)
 
     # === Calendar ===
     def _create_calendar_event(self, payload: dict, text: str) -> SkillResult:
@@ -228,6 +337,30 @@ class Orchestrator:
             message="\n".join(lines),
             data={"has_events": bool(events if calendar else False), "email_count": len(emails) if email else 0},
         )
+
+    def _fetch_news(self, payload: dict) -> SkillResult:
+        """Fetch news, tech, or trending videos."""
+        category = payload.get("category", "news")
+        max_results = payload.get("max_results", 5)
+        
+        news_skill = self.skill_registry.get_skill("news_extractor")
+        if not news_skill:
+            return SkillResult(
+                success=False,
+                skill="orchestrator",
+                action="fetch_news",
+                message="News extractor unavailable - skill not loaded"
+            )
+        
+        # Map category to action
+        action_map = {
+            "news": "fetch_news",
+            "tech": "fetch_tech",
+            "trending": "fetch_trending"
+        }
+        
+        action = action_map.get(category, "fetch_news")
+        return news_skill.execute(action, {"max_results": max_results}, self.context)
 
     # === Review Flow ===
     def _review_key(self, sender: str) -> str:
